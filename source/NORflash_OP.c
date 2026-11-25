@@ -14,6 +14,7 @@
 #include "lang.h"
 #include "Ezcard_OP.h"
 #include "GBApatch.h"
+#include "showcht.h"
 //#define DEBUG
 
 extern FM_NOR_FS pNorFS[MAX_NOR]EWRAM_BSS;
@@ -346,7 +347,14 @@ u32 IWRAM_CODE Loadfile2NOR(TCHAR *filename, u32 NORaddress,u16 have_patch,u8 SA
 		if(res != FR_OK)
 				return 0;
 		
-		filesize = f_size(&gfile);		
+		filesize = f_size(&gfile);
+        if(have_patch && !BlueCheatRuntimeFits()) {
+            f_close(&gfile); ShowbootProgress("Cheat runtime does not fit"); wait_btn(); return 1;
+        }
+
+        if (have_patch && gl_cheat_on==1 && !BlueCheatPrepareRom(filename)) {
+            f_close(&gfile); ShowbootProgress("Cheat ROM read failed"); wait_btn(); return 1;
+        }		
 		f_lseek(&gfile, 0xa0);		
 		f_read(&gfile, temp, 0x10, (UINT *)&ret);//read game name
 		f_lseek(&gfile, 0xB0);		
@@ -414,6 +422,8 @@ u32 IWRAM_CODE Loadfile2NOR(TCHAR *filename, u32 NORaddress,u16 have_patch,u8 SA
 				GBApatch_Cleanrom_NOR((u32*)pReadCache,blocknum);
 			}
 
+            if(have_patch && gl_cheat_on==1)
+                BlueCheatApplyNOR(blocknum, (filesize-blocknum < 0x20000u) ? filesize-blocknum : 0x20000u);
 			Block_Erase(blocknum + Write2Addr);		
 			WriteFlash_with64word(blocknum + Write2Addr,pReadCache,0x20000);
 

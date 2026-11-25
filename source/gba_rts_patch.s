@@ -1,5 +1,13 @@
+.syntax divided
+.macro RTS_ADRL reg, target
+    ldr \reg, 991f
+    add \reg, pc, \reg
+    b 992f
+991: .word \target - 991b
+992:
+.endm
 @;--------------------------------------------------------------------
-	.section   	.iwram,"ax",%progbits
+	.section   	.rodata,"a",%progbits
 		
 	.global  RTS_ReplaceIRQ_start
 	.global  RTS_ReplaceIRQ_end
@@ -136,27 +144,7 @@ check_sleep:
 	cmp 		r2,r3 			
 	beq 		sleep_now
 	
-	@;check cheat
-	adrl 		r2,CheatONOFF
-	ldr 		r2,[r2]
-	ldr 		r2,[r2] @	
-	cmp 		r2,#1
-	bne 		nocheat
-	stmfd   SP!, {r4-r6}	
-	adrl 		r5,CHEAT
-	adrl		r6,Cheat_count
-	ldr			r2,[r6]
-cheat_loop:
-	cmp			r2,#0
-	beq			cheat_loop_end	
-	ldmia   r5!,{r3-r4}
-	strb		r4,[r3]
-	sub 		r2,#0x01
-	b				cheat_loop
-cheat_loop_end:
-	ldmfd   SP!, {r4-r6}
-nocheat:
-	ldr 		pc,[r0,#-(0x04000000-0x03FFFFF4)] @;to normal IRQ routine									
+	b enhanced_cheat_entry
 @;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 @;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 reset_now:
@@ -1318,11 +1306,324 @@ s_badRTS:
 	.align	
 RTS_switch: 
 	.word 0x00000000
+.syntax unified
+enhanced_cheat_entry:
+	@;check cheat
+	RTS_ADRL 		r2,CheatONOFF
+	ldr 		r2,[r2]
+	ldr 		r2,[r2] @
+	cmp 		r2,#1
+	bne 		nocheat
+	stmfd   SP!, {r4-r11,lr}
+	mov			r1,sp			@ saved-register frame base for malformed-table recovery
+    sub sp,sp,#16
+    mov r0,sp                 @ writable 16-level IF stack; never STRB into ROM
+	RTS_ADRL 		r5,CHEAT
+	RTS_ADRL		r7,Cheat_count
+	ldr			r2,[r7]
+	mov			r6,#1			@ current branch state: 1 = operations enabled
+cheat_loop:
+	cmp			r2,#0
+	beq			cheat_loop_end
+	ldmia   r5!,{r3-r4}
+	sub 		r2,#0x01
+
+	@ Enhanced runtime opcode dispatch. Normal records are direct W8 writes.
+	@ The high byte is below F1 for every normal address. F1-FF are a dense
+	@ opcode range, so keep a zero-based opcode index in r7 and dispatch through
+	@ position-independent ARM branches.
+	mov			r12,r3,lsr #24
+	cmp			r12,#0xF1
+	blo			cheat_direct_write
+	sub			r7,r12,#0xF1	@ F1=0 through FF=14
+	add			pc,pc,r7,lsl #2
+	nop
+	b				cheat_if		@ F1 IF
+	b				cheat_if		@ F2 IFNE
+	b				cheat_if		@ F3 IFLT
+	b				cheat_if		@ F4 IFGT
+	b				cheat_if		@ F5 IFLE
+	b				cheat_if		@ F6 IFGE
+	b				cheat_else		@ F7 ELSE
+	b				cheat_endif		@ F8 ENDIF
+	b				cheat_add_sub	@ F9 ADD
+	b				cheat_add_sub	@ FA SUB
+	b				cheat_ptr		@ FB PTR
+	b				cheat_loop		@ FC orphan data marker: ignore safely
+	b				cheat_write_width	@ FD W16 (dispatcher index 12)
+	b				cheat_write_width	@ FE W32 (dispatcher index 13)
+	b				cheat_compact	@ FF FILL/SLIDE
+
+cheat_direct_write:
+	cmp			r6,#0
+	strbne			r4,[r3]
+	b				cheat_loop
+
+@;------------------------------------------------------------------
+@; Compact direct W16/W32. The dispatcher index is 12 for FD/W16 and
+@; 13 for FE/W32, so subtract 11 to derive width code 1 or 2 here.
+cheat_write_width:
+	cmp			r6,#0
+	beq			cheat_loop
+	sub			r11,r7,#11
+	bl			cheat_decode_compact
+	bl			cheat_store_width
+	b				cheat_loop
+
+@;------------------------------------------------------------------
+@; IF/IFNE/IFLT/IFGT/IFLE/IFGE. Masked IF*M forms consume a following
+@; CHT_OP_DATA record and compare (memory & mask) against the stored value.
+cheat_if:
+	mov			r9,r7			@ preserve zero-based condition index (IF=0..IFGE=5)
+	tst			r3,#0x00800000
+	beq			cheat_if_mask_ready
+	mov			r8,r3			@ preserve IF descriptor across shared FC reader
+	bl			cheat_read_data_record
+	mov			r10,r12		@ preserve comparison mask
+	mov			r3,r8
+cheat_if_mask_ready:
+	cmp			r6,#0
+	beq			cheat_if_false
+	mov			r11,r3,lsr #20
+	and			r11,r11,#3
+	bl			cheat_decode_compact
+	bl			cheat_load_width
+	tst			r3,#0x00800000
+	andne		r8,r8,r10
+
+	@ Compare once, then use the F1-F6 opcode index to select the matching
+	@ unsigned ARM condition. Each table entry resolves to the shared true or
+	@ false result path, preserving the original IF/IFNE/IFLT/IFGT/IFLE/IFGE
+	@ behavior without five opcode comparisons and six duplicated cmp blocks.
+	cmp			r8,r4
+	add			pc,pc,r9,lsl #3
+	nop
+	beq			cheat_if_true	@ 0: IF / equal
+	b				cheat_if_false
+	bne			cheat_if_true	@ 1: IFNE / not equal
+	b				cheat_if_false
+	blo			cheat_if_true	@ 2: IFLT / unsigned lower
+	b				cheat_if_false
+	bhi			cheat_if_true	@ 3: IFGT / unsigned higher
+	b				cheat_if_false
+	bls			cheat_if_true	@ 4: IFLE / unsigned lower or same
+	b				cheat_if_false
+	bhs			cheat_if_true	@ 5: IFGE / unsigned higher or same
+	b				cheat_if_false
+cheat_if_true:
+	mov			r10,#1
+	b				cheat_if_push
+cheat_if_false:
+	mov			r10,#0
+cheat_if_push:
+	mov             r12,r1              @ exclusive end of private IRQ IF stack
+	cmp			r0,r12
+	bhs			cheat_abort
+	orr			r12,r6,r10,lsl #1	@ bit 0 = parent state, bit 1 = IF result
+	strb		r12,[r0],#1
+	and			r6,r6,r10
+	b				cheat_loop
+
+cheat_else:
+	sub             r12,r1,#16          @ start of private IRQ IF stack
+	cmp			r0,r12
+	bls			cheat_abort
+	ldrb		r12,[r0,#-1]
+	and			r6,r12,#1		@ restore parent state
+	tst			r12,#2			@ invert the stored IF result
+	movne		r6,#0
+	b				cheat_loop
+
+cheat_endif:
+	sub             r12,r1,#16          @ start of private IRQ IF stack
+	cmp			r0,r12
+	bls			cheat_abort
+	ldrb		r12,[r0,#-1]!
+	and			r6,r12,#1		@ restore parent state
+	b				cheat_loop
+
+@;------------------------------------------------------------------
+@; Width-aware ADD/SUB. One record contains operation, width, address and value.
+cheat_add_sub:
+	mov			r9,r7			@ zero-based opcode index: F9=8, FA=9
+	cmp			r6,#0
+	beq			cheat_loop
+	mov			r11,r3,lsr #20
+	and			r11,r11,#3
+	bl			cheat_decode_compact
+	bl			cheat_load_width
+	cmp			r9,#8
+	addeq		r4,r8,r4
+	subne		r4,r8,r4
+	bl			cheat_store_width
+	b				cheat_loop
+
+@;------------------------------------------------------------------
+@; PTR:Wn,pointer-address,offset,value. One following data slot holds value.
+cheat_ptr:
+	mov			r10,r4			@ signed/two's-complement offset
+	mov			r11,r3,lsr #20
+	and			r11,r11,#3
+	bl			cheat_decode_compact
+	bl			cheat_read_data_record
+	mov			r9,r12			@ pointer write value
+	cmp			r6,#0
+	beq			cheat_loop
+	ldr			r7,[r7]
+	add			r7,r7,r10
+	mov			r12,#1
+	mov			r12,r12,lsl r11
+	sub			r8,r12,#1
+	tst			r7,r8
+	bne			cheat_loop
+	@ High byte 02/03 selects EWRAM/IWRAM. Once the destination is
+	@ naturally aligned, a valid start cannot cross either region boundary.
+	mov			r8,r7,lsr #24
+	sub			r8,r8,#2
+	cmp			r8,#1
+	bhi			cheat_loop
+	mov			r12,#0x04000000	@ EWRAM lower-24-bit limit, shifted by 8
+	cmp			r8,#0
+	movne		r12,#0x00800000	@ IWRAM lower-24-bit limit, shifted by 8
+	mov			r8,r7,lsl #8
+	cmp			r8,r12
+	bhs			cheat_loop
+	mov			r4,r9
+	bl			cheat_store_width
+	b				cheat_loop
+
+@;------------------------------------------------------------------
+@; FILL uses two records; SLIDE uses four, regardless of repetition count.
+cheat_compact:
+	tst			r3,#0x00800000
+	bne			cheat_slide
+	mov			r10,r4			@ repeat count
+	mov			r11,r3,lsr #20
+	and			r11,r11,#3
+	bl			cheat_decode_compact
+	bl			cheat_read_data_record
+	mov			r4,r12			@ fill value
+	cmp			r6,#0
+	beq			cheat_loop
+cheat_fill_loop:
+	cmp			r10,#0
+	beq			cheat_loop
+	bl			cheat_store_width
+	mov			r12,#1
+	mov			r12,r12,lsl r11
+	add			r7,r7,r12
+	sub			r10,r10,#1
+	b				cheat_fill_loop
+
+cheat_slide:
+	cmp			r2,#3
+	blo			cheat_abort
+	mov			r10,r4			@ repeat count
+	mov			r11,r3,lsr #20
+	and			r11,r11,#3
+	bl			cheat_decode_compact
+	bl			cheat_read_data_record_available
+	mov			r8,r12			@ address step
+	bl			cheat_read_data_record_available
+	mov			r9,r12			@ value step
+	bl			cheat_read_data_record_available
+	mov			r4,r12			@ initial value
+	cmp			r6,#0
+	beq			cheat_loop
+cheat_slide_loop:
+	cmp			r10,#0
+	beq			cheat_loop
+	bl			cheat_store_width
+	add			r7,r7,r8
+	add			r4,r4,r9
+	cmp			r11,#0
+	andeq		r4,r4,#0xFF
+	cmp			r11,#1
+	moveq		r12,r4,lsl #16
+	moveq		r4,r12,lsr #16
+	sub			r10,r10,#1
+	b				cheat_slide_loop
+
+@;------------------------------------------------------------------
+@; Consume one required FC data record. The payload is returned in r12.
+@; r2 is decremented exactly once for a valid available slot. A missing or
+@; malformed slot aborts the complete runtime list, matching the old inline
+@; checks used by masked IF, PTR, FILL and SLIDE. r3 is scratch/output only.
+cheat_read_data_record:
+	cmp			r2,#1
+	blo			cheat_abort
+cheat_read_data_record_available:
+	sub			r2,r2,#1
+	ldmia   r5!,{r3,r12}
+	mov			r3,r3,lsr #24
+	cmp			r3,#0xFC
+	bne			cheat_abort
+	bx			lr
+
+@;------------------------------------------------------------------
+@; Decode lower-20-bit compact address in r3 to full GBA address in r7.
+@; Region bits 19:18 select EWRAM, IWRAM or I/O. Clamp region 3 to
+@; the I/O mapping, then derive the old 0x00000000/0x00FC0000/
+@; 0x01F80000 offsets arithmetically without literal-pool loads.
+cheat_decode_compact:
+	mov			r7,r3,lsl #12
+	mov			r7,r7,lsr #12
+	mov			r12,r7,lsr #18
+	cmp			r12,#2
+	movhi		r12,#2
+	rsb			r12,r12,r12,lsl #6
+	add			r7,r7,r12,lsl #18
+	add			r7,r7,#0x02000000
+	bx			lr
+
+@; r7=address, r11=0/1/2 width code, result r8.
+@ Use explicit branches instead of conditional byte/halfword mnemonics so
+@ this assembles correctly with devkitARM r54's ARM/Thumb syntax mode.
+cheat_load_width:
+	cmp			r11,#1
+	blo			cheat_load_width_byte
+	beq			cheat_load_width_half
+	ldr			r8,[r7]
+	bx			lr
+cheat_load_width_byte:
+	ldrb		r8,[r7]
+	bx			lr
+cheat_load_width_half:
+	ldrh		r8,[r7]
+	bx			lr
+
+@; r7=address, r11=0/1/2 width code, r4=value.
+cheat_store_width:
+	cmp			r11,#1
+	blo			cheat_store_width_byte
+	beq			cheat_store_width_half
+	str			r4,[r7]
+	bx			lr
+cheat_store_width_byte:
+	strb		r4,[r7]
+	bx			lr
+cheat_store_width_half:
+	strh		r4,[r7]
+	bx			lr
+
+cheat_abort:
+	mov			sp,r1
+	mov			r2,#0
+	b				cheat_loop_end
+
+cheat_loop_end:
+    mov sp,r1                 @ discard temporary IF stack on every exit
+	ldmfd   SP!, {r4-r11,lr}
+nocheat:
+	mov			r0,#0x4000000
+	ldr 		pc,[r0,#-(0x04000000-0x03FFFFF4)] @;to normal IRQ routine
+
+	.align
 Cheat_count:
 	.word 0x00000000	
 no_CHEAT_end:
 CHEAT:
-	.space 0x400
+@ Runtime records are appended by GBApatch.c.
 	.align
 RTS_ReplaceIRQ_end:
    .end
