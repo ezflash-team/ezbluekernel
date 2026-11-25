@@ -2959,7 +2959,7 @@ re_show_menu:
 		}
 		else if(keysup & KEY_B)
 		{
-			gl_cheat_count = 0;
+			ResetCompiledCheats();
 			if(play_re!=0xBB){
 				strncpy(currentpath, currentpath_temp, 256);//
 			}
@@ -3134,6 +3134,10 @@ re_show_menu:
 				gl_rts_on 	= Read_SET_info(assress_v_rts);
 				gl_sleep_on = Read_SET_info(assress_v_sleep);
 				gl_cheat_on = Read_SET_info(assress_v_cheat);
+                if(gl_cheat_on==1 && !BlueCheatPrepareRom(pfilename)) {
+                    ShowbootProgress("Cheat ROM read failed"); wait_btn(); return 0;
+                }
+
 				
 				//Set_DDR_flag(0x2); //DDR w
 				if((gl_reset_on==1) || (gl_rts_on==1) || (gl_sleep_on==1) || (gl_cheat_on==1))
@@ -3164,7 +3168,7 @@ re_show_menu:
 						f_read(&gfile, pReadCache, 0x20000, (UINT*)&ret);
 						f_close(&gfile);
 						SetTrimSize(pReadCache,gamefilesize,0x20000,0x0,SAVEMODE);						
-						if((gl_engine_sel==0) || (gl_select_lang == 0xE2E2))
+						if((gl_engine_sel==0) || (gl_select_lang == 0xE2E2) || gl_cheat_on==1)
 						{	
 								get_find:		
 			    		FAT_table_buffer[0x1F4/4] = SET_PARAMETER_MODE;
@@ -3186,6 +3190,9 @@ re_show_menu:
 			    		}
 						}
 					}	
+                if(!BlueCheatRuntimeFits()) {
+                    ShowbootProgress("Cheat runtime does not fit"); wait_btn(); return 0;
+                }
 	    		Patch_SpecialROM_sleepmode();//    		
 	    		GBApatch_DDR(PSRAMBase_S98,gamefilesize,0x400);	//ddr rompage = 0x400 																																		
 				}

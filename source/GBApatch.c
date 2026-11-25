@@ -29,10 +29,12 @@ u32 w_reset_on;
 u32 w_rts_on;
 u32 w_sleep_on;
 u32 w_cheat_on;
+u32 w_cheat_revision;
+#define BLUE_CHEAT_CACHE_REVISION 0x42434801u
 
 SPatchInfo2 iPatchInfo2[EMax];
 u32 iCount2;
-extern ST_entry pCHEAT[256];
+extern ST_entry pCHEAT[MAX_RUNTIME_CHEAT_RECORDS];
 
 #define sizeofa(array) (sizeof(array)/sizeof(array[0]))
 extern u32 FAT_table_buffer[FAT_table_size/4]EWRAM_BSS;
@@ -273,21 +275,16 @@ void SetTrimSize(u8* buffer,u32 romsize,u32 iSize,u32 mode,BYTE saveMODE)
   u32 top;
   u32 alignedSize;
 
-	u32  PATCH_LENGTH;
+    u32 PATCH_LENGTH;
+    /* Function = Reserve the actual enhanced runtime size when cheats are on. */
+    if (gl_cheat_on == 1 || (gl_rts_on==1 && (gl_reset_on==1 || gl_sleep_on==1))) {
+        PATCH_LENGTH=(u32)((u8*)RTS_ReplaceIRQ_end-(u8*)RTS_ReplaceIRQ_start)
+            + MAX_RUNTIME_CHEAT_RECORDS*8u;
+        PATCH_LENGTH=(PATCH_LENGTH+31u)&~15u;
+    } else {
+        PATCH_LENGTH=(gl_rts_on==1) ? 0x1000u : 0x300u;
+    }
 
-	if((gl_rts_on==1)/* || (gl_cheat_on==1)*/ )		
-	{
-		PATCH_LENGTH = 0x1000;
-	}
-	else 
-	{
-		PATCH_LENGTH = 0x300;	
-	}
-	
-	if(gl_cheat_on==1){
-		PATCH_LENGTH = 0x2000;
-	}
-	
   if(0)
   {
 	  iTrimSize = 0x1fff000;
@@ -436,7 +433,13 @@ void Patch_Reset_Sleep(u32 *Data)
 //------------------------------------------------------------------
 void Patch_RTS_Cheat(u32 *Data,u32 gamerompage)
 {
-	Patch_B_address();
+    u32 required = (u32)((u8*)no_CHEAT_end-(u8*)RTS_ReplaceIRQ_start)
+        + gl_cheat_count*8u;
+    /* Function = Reject incomplete runtime injection before changing the hook. */
+    if (gl_cheat_count > MAX_RUNTIME_CHEAT_RECORDS || required > 0x5400u ||
+        iTrimSize > 0x2000000u-required ||
+        (is_NORpatch && (iTrimSize & 0x1FFFFu)+required > 0x20000u)) return;
+    Patch_B_address();
 	u32 Return_address = 0x8000000+ EA_offset*4 + 8;
 	
   u8 * p_patch_start  = (u8*)RTS_ReplaceIRQ_start;
@@ -502,29 +505,17 @@ void Patch_RTS_Cheat(u32 *Data,u32 gamerompage)
 	
 	u32 cheat_offset = (u8*)CHEAT - p_patch_start;
 
-	for (u32 ii = 0; ii<gl_cheat_count; ii++)
-	{
-		if(pCHEAT[ii].address >= 0x40000)
-		{
-			*(vu32*)(patchbuffer+cheat_offset+8*ii) = ((pCHEAT[ii].address)&0x7FFF) + 0x3000000;	
-		}
-		else
-		{
-			*(vu32*)(patchbuffer+cheat_offset+8*ii) = ((pCHEAT[ii].address)&0x3FFFF) + 0x2000000;	
-		}
-		*(vu32*)(patchbuffer+cheat_offset+8*ii+4) = pCHEAT[ii].VAL;	
-
-	}
-
-	u32 copysize = p_no_cheat_end-p_patch_start ;
-
-	copysize = copysize +  gl_cheat_count*8;
-	
-	if(	iTrimSize+copysize > 0x2000000){
-		copysize = 0x2000000 - iTrimSize;
-	}
-
-		
+    u32 output_count = 0;
+    for (u32 ii=0; gl_cheat_on==1 && ii<gl_cheat_count; ++ii) {
+        u32 address;
+        if (!IsRuntimeCheatRecordActive(ii)) continue;
+        if (!ResolveRuntimeCheatRecordAddress(pCHEAT[ii].address,&address)) return;
+        *(vu32*)(patchbuffer+cheat_offset+8*output_count) = address;
+        *(vu32*)(patchbuffer+cheat_offset+8*output_count+4) = pCHEAT[ii].VAL;
+        ++output_count;
+    }
+    *(vu32*)(patchbuffer+cheat_count_offset) = output_count;
+    u32 copysize = (u32)(p_no_cheat_end-p_patch_start)+output_count*8u;
 
 	Write(iTrimSize, patchbuffer,copysize);
 
@@ -664,6 +655,8 @@ void GBApatch_DDR(u32* address,int filesize,u32 gamerompage)//Only once
 	PatchDragonBallZ(address);
 	Patch_somegame(address);
 	
+	if(gl_cheat_on==1) BlueCheatApplyDDR((u32)filesize);
+
 	if( (gl_rts_on==1) && (gl_cheat_on == 0)  && (gl_reset_on == 0)  && (gl_sleep_on == 0)  ) {
 		spend_address = Get_spend_address(address);
 
@@ -698,6 +691,12 @@ void GBApatch_Cleanrom_NOR(u32* address,u32 offset)
 //------------------------------------------------------------------
 void GBApatch_NOR(u32* address,int filesize,u32 offset,u32 gamerompage)
 {
+    if (gl_cheat_on == 1 && gl_cheat_count > 0) {
+        u32 required=(u32)((u8*)no_CHEAT_end-(u8*)RTS_ReplaceIRQ_start)+gl_cheat_count*8u;
+        if (required > 0x5400u || iTrimSize > 0x2000000u-required ||
+            (iTrimSize & 0x1FFFFu)+required > 0x20000u) return;
+    }
+
 	windows_offset = offset;
 	is_NORpatch = 1;
   if(offset==0)
@@ -778,6 +777,7 @@ void GBA_patch_init_buffer(u32* buffer)
 	w_rts_on = buffer[start+9];
 	w_sleep_on = buffer[start+10];
 	w_cheat_on = buffer[start+11];
+	w_cheat_revision = buffer[start+12];
 }
 //------------------------------------------------------------------
 u32 Check_pat(TCHAR* gamefilename)
@@ -798,7 +798,7 @@ u32 Check_pat(TCHAR* gamefilename)
 		{
 			patfilesize = f_size(&gfile);		
 			
-			if(patfilesize > MAX_pReadCache_size){
+			if(patfilesize > MAX_pReadCache_size || patfilesize < sizeof(iPatchInfo2)+64u){
 				f_close(&gfile);
 				find_the_patfile = 0;
 			}else{
@@ -827,7 +827,9 @@ u32 Check_pat(TCHAR* gamefilename)
 		//read patch information
 		GBA_patch_init_buffer((u32*)pReadCache);
 		
-		if( (w_reset_on !=gl_reset_on)  || (w_rts_on !=gl_rts_on)  || (w_sleep_on !=gl_sleep_on) || (w_cheat_on !=gl_cheat_on))
+		if( (w_reset_on !=gl_reset_on)  || (w_rts_on !=gl_rts_on)  || (w_sleep_on !=gl_sleep_on) || (w_cheat_on !=gl_cheat_on) ||
+            ((gl_cheat_on==1 || (gl_rts_on==1 && (gl_reset_on==1 || gl_sleep_on==1))) &&
+             w_cheat_revision!=BLUE_CHEAT_CACHE_REVISION))
 		{
 			GBA_patch_init();
 			find_the_patfile = 0;
@@ -873,6 +875,7 @@ void Make_pat_file(TCHAR* gamefilename)
 			w_buffer[9] = gl_rts_on;
 			w_buffer[10] = gl_sleep_on;
 			w_buffer[11] = gl_cheat_on;
+            w_buffer[12] = BLUE_CHEAT_CACHE_REVISION;
 					
 			res=f_write(&gfile, (void*)w_buffer, sizeof(w_buffer), (UINT*)&written);
 			f_close(&gfile);
@@ -1522,4 +1525,14 @@ void Patch_somegame(u32 *Data)
     	}
 		}
 	}
+}
+/* Function = Validate complete cheat injection before loading/programming a ROM. */
+u32 BlueCheatRuntimeFits(void)
+{
+    u32 required=(u32)((u8*)no_CHEAT_end-(u8*)RTS_ReplaceIRQ_start)
+        + gl_cheat_count*8u;
+    if (gl_cheat_on!=1 || gl_cheat_count==0) return 1;
+    return gl_cheat_count<=MAX_RUNTIME_CHEAT_RECORDS && required<=0x5400u &&
+        iTrimSize<=0x2000000u-required &&
+        (iTrimSize & 0x1FFFFu)+required<=0x20000u;
 }
